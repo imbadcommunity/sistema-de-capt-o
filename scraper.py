@@ -2,119 +2,189 @@ import asyncio
 from playwright.async_api import async_playwright
 import time
 
-async def scrape_google_maps(search_term: str, max_results: int = 20):
+
+async def scrape_google_maps(search_term: str, max_results: int = 30, status_callback=None):
     """
     Realiza uma busca no Google Maps via Playwright e capta os dados básicos
     de empresas que NÃO possuem website listado.
+    
+    Args:
+        search_term: Termo de busca (ex: "Restaurantes em São Paulo")
+        max_results: Número máximo de resultados para analisar
+        status_callback: Função opcional para reportar progresso (usada pela UI)
     """
     leads = []
-    
-    print(f"[*] Iniciando busca por: {search_term}")
-    
+
+    def report(msg):
+        if status_callback:
+            status_callback(msg)
+        try:
+            print(msg)
+        except UnicodeEncodeError:
+            print(msg.encode("ascii", errors="replace").decode("ascii"))
+
+    report(f"🔍 Iniciando busca por: {search_term}")
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False) # Headless=False para evitar bloqueios do Google
-        context = await browser.new_context(locale="pt-BR")
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            locale="pt-BR",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
-        
+
         # Acessar o Google Maps
-        await page.goto(f"https://www.google.com/maps/search/{search_term.replace(' ', '+')}")
-        
+        search_url = f"https://www.google.com/maps/search/{search_term.replace(' ', '+')}"
+        report(f"🌐 Acessando Google Maps...")
+        await page.goto(search_url)
+
         try:
             # Esperar carregar os resultados iniciais
-            await page.wait_for_selector('a[href*="https://www.google.com/maps/place/"]', timeout=10000)
-            print("[*] Resultados carregados. Extraindo dados...")
-        except Exception as e:
-            print(f"[!] Não foi possível encontrar resultados para '{search_term}'.")
+            await page.wait_for_selector('div[role="feed"]', timeout=15000)
+            report("✅ Página carregada. Procurando resultados...")
+        except Exception:
+            report(f"⚠️ Não foi possível encontrar resultados para '{search_term}'.")
             await browser.close()
             return leads
 
-        # Lógica de scroll para carregar mais resultados (simplificada)
-        # Em um cenário real, precisaríamos encontrar o painel lateral e scrollar
-        
-        # Extrair links de locais
-        places = await page.query_selector_all('a[href*="https://www.google.com/maps/place/"]')
-        
-        # Limitar o número de lugares para não demorar demais no teste
-        places_hrefs = []
-        for place in places:
-            href = await place.get_attribute('href')
-            if href and href not in places_hrefs:
-                places_hrefs.append(href)
-                
-        places_hrefs = places_hrefs[:max_results]
-        print(f"[*] Encontrados {len(places_hrefs)} locais iniciais. Analisando...")
+        # Scroll no feed lateral para carregar mais resultados
+        feed = await page.query_selector('div[role="feed"]')
+        if feed:
+            report("📜 Carregando mais resultados (scrolling)...")
+            for i in range(5):
+                await feed.evaluate("el => el.scrollTop = el.scrollHeight")
+                await page.wait_for_timeout(1500)
 
-        for href in places_hrefs:
+        # Extrair links de locais
+        place_links = await page.query_selector_all('a[href*="/maps/place/"]')
+
+        # Deduplica e limita
+        places_hrefs = []
+        seen = set()
+        for link in place_links:
+            href = await link.get_attribute('href')
+            if href and href not in seen:
+                seen.add(href)
+                places_hrefs.append(href)
+
+        places_hrefs = places_hrefs[:max_results]
+        total = len(places_hrefs)
+        report(f"📍 {total} locais encontrados. Analisando um por um...")
+
+        for idx, href in enumerate(places_hrefs, 1):
             try:
-                # Abrir nova aba para cada local para não perder o feed principal
+                report(f"🔎 Analisando {idx}/{total}...")
                 new_page = await context.new_page()
-                await new_page.goto(href)
-                await new_page.wait_for_load_state('networkidle')
-                
+                await new_page.goto(href, wait_until="domcontentloaded")
+                await new_page.wait_for_timeout(2000)
+
                 # Extrair Nome
-                name_element = await new_page.query_selector('h1')
-                name = await name_element.inner_text() if name_element else "Sem Nome"
-                
-                # Verificar se tem Website
-                # O Google Maps geralmente usa um ícone de "Mundo" para o website e texto do domínio.
-                # Podemos procurar por botões/links que contenham "Website" ou que o href não seja do Google.
-                website_elements = await new_page.query_selector_all('a[data-item-id="authority"]')
-                
+                name_el = await new_page.query_selector('h1')
+                name = (await name_el.inner_text()).strip() if name_el else "Sem Nome"
+
+                # Verificar se tem Website — botão "Website" ou link de autoridade
                 has_website = False
-                if website_elements:
+
+                # Método 1: Botão com texto "Website"
+                website_btn = await new_page.query_selector('a[data-item-id="authority"]')
+                if website_btn:
                     has_website = True
-                
+
+                # Método 2: Procurar pelo texto "Website" nos botões de ação
+                if not has_website:
+                    buttons = await new_page.query_selector_all('button')
+                    for btn in buttons:
+                        try:
+                            text = await btn.inner_text()
+                            if "site" in text.lower() or "website" in text.lower():
+                                has_website = True
+                                break
+                        except:
+                            pass
+
                 if has_website:
-                    # Tem site, ignoramos!
+                    report(f"   ❌ {name} → Tem site. Ignorando.")
                     await new_page.close()
                     continue
-                    
-                # Não tem site, vamos extrair o resto:
-                
+
+                # Empresa sem site! Captar dados.
+
                 # Telefone
-                phone_element = await new_page.query_selector('button[data-tooltip="Copiar número de telefone"]')
-                phone = await phone_element.inner_text() if phone_element else ""
-                if phone:
-                    phone = phone.strip()
-                
+                phone = ""
+                phone_btn = await new_page.query_selector('button[data-tooltip="Copiar número de telefone"]')
+                if phone_btn:
+                    phone = (await phone_btn.inner_text()).strip()
+                else:
+                    # Alternativa: procurar pelo ícone de telefone
+                    phone_items = await new_page.query_selector_all('button[data-item-id^="phone"]')
+                    for item in phone_items:
+                        try:
+                            phone = (await item.inner_text()).strip()
+                            break
+                        except:
+                            pass
+
                 # Endereço
-                address_element = await new_page.query_selector('button[data-tooltip="Copiar endereço"]')
-                address = await address_element.inner_text() if address_element else ""
-                if address:
-                    address = address.strip()
-                    
-                # Avaliação e Categoria podem ser complexos de pegar devido a estrutura dinâmica.
-                # Simplificando a extração:
+                address = ""
+                addr_btn = await new_page.query_selector('button[data-item-id="address"]')
+                if addr_btn:
+                    address = (await addr_btn.inner_text()).strip()
+                else:
+                    addr_btn2 = await new_page.query_selector('button[data-tooltip="Copiar endereço"]')
+                    if addr_btn2:
+                        address = (await addr_btn2.inner_text()).strip()
+
+                # Avaliação
                 rating = ""
-                reviews = ""
-                category = search_term # Default fallback
-                
                 try:
-                    rating_element = await new_page.query_selector('div.F7nice > span > span')
-                    if rating_element:
-                        rating = await rating_element.inner_text()
+                    rating_el = await new_page.query_selector('div.F7nice span[aria-hidden="true"]')
+                    if rating_el:
+                        rating = (await rating_el.inner_text()).strip()
                 except:
                     pass
-                
+
+                # Número de avaliações
+                reviews = ""
+                try:
+                    reviews_el = await new_page.query_selector('div.F7nice span span')
+                    if reviews_el:
+                        reviews_text = (await reviews_el.inner_text()).strip()
+                        reviews = reviews_text.replace("(", "").replace(")", "").strip()
+                except:
+                    pass
+
+                # Categoria
+                category = ""
+                try:
+                    cat_el = await new_page.query_selector('button[jsaction*="category"]')
+                    if cat_el:
+                        category = (await cat_el.inner_text()).strip()
+                except:
+                    pass
+                if not category:
+                    category = search_term
+
                 leads.append({
                     "Name": name,
                     "Phone": phone,
                     "Address": address,
                     "Category": category,
                     "Rating": rating,
-                    "Reviews": reviews
+                    "Reviews": reviews,
                 })
-                print(f"[+] Lead Encontrado: {name} | Tel: {phone}")
-                
+                report(f"   ✅ LEAD: {name} | Tel: {phone}")
+
                 await new_page.close()
-                
+
             except Exception as e:
-                print(f"[-] Erro ao processar um local: {e}")
-                
+                report(f"   ⚠️ Erro ao processar local {idx}: {e}")
+
         await browser.close()
-        
+
+    report(f"\n🏁 Busca finalizada! {len(leads)} leads SEM SITE encontrados.")
     return leads
 
-def run_scraper(search_term: str):
+
+def run_scraper(search_term: str, max_results: int = 30, status_callback=None):
     """Wrapper síncrono para o scraper assíncrono."""
-    return asyncio.run(scrape_google_maps(search_term))
+    return asyncio.run(scrape_google_maps(search_term, max_results, status_callback))
