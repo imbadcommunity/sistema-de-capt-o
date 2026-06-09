@@ -1,19 +1,40 @@
 import asyncio
 from playwright.async_api import async_playwright
-import time
+import json
+import os
+
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "history.json")
+
+
+def load_history():
+    """Carrega o histórico de empresas já vistas."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_history(history: set):
+    """Salva o histórico de empresas já vistas."""
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(history), f, ensure_ascii=False)
 
 
 async def scrape_google_maps(search_term: str, max_results: int = 30, status_callback=None):
     """
     Realiza uma busca no Google Maps via Playwright e capta os dados básicos
     de empresas que NÃO possuem website listado.
-    
-    Args:
-        search_term: Termo de busca (ex: "Restaurantes em São Paulo")
-        max_results: Número máximo de resultados para analisar
-        status_callback: Função opcional para reportar progresso (usada pela UI)
+
+    - Empresas COM site sao ignoradas e NAO contabilizadas.
+    - Empresas ja vistas em buscas anteriores sao puladas automaticamente.
     """
     leads = []
+    history = load_history()
+    skipped_has_site = 0
+    skipped_already_seen = 0
 
     def report(msg):
         if status_callback:
@@ -23,7 +44,8 @@ async def scrape_google_maps(search_term: str, max_results: int = 30, status_cal
         except UnicodeEncodeError:
             print(msg.encode("ascii", errors="replace").decode("ascii"))
 
-    report(f"🔍 Iniciando busca por: {search_term}")
+    report(f"[BUSCA] Iniciando busca por: {search_term}")
+    report(f"[HISTORICO] {len(history)} empresas ja vistas anteriormente.")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -35,22 +57,21 @@ async def scrape_google_maps(search_term: str, max_results: int = 30, status_cal
 
         # Acessar o Google Maps
         search_url = f"https://www.google.com/maps/search/{search_term.replace(' ', '+')}"
-        report(f"🌐 Acessando Google Maps...")
+        report(f"[NAV] Acessando Google Maps...")
         await page.goto(search_url)
 
         try:
-            # Esperar carregar os resultados iniciais
             await page.wait_for_selector('div[role="feed"]', timeout=15000)
-            report("✅ Página carregada. Procurando resultados...")
+            report("[OK] Pagina carregada. Procurando resultados...")
         except Exception:
-            report(f"⚠️ Não foi possível encontrar resultados para '{search_term}'.")
+            report(f"[ERRO] Nao foi possivel encontrar resultados para '{search_term}'.")
             await browser.close()
             return leads
 
         # Scroll no feed lateral para carregar mais resultados
         feed = await page.query_selector('div[role="feed"]')
         if feed:
-            report("📜 Carregando mais resultados (scrolling)...")
+            report("[SCROLL] Carregando mais resultados...")
             for i in range(5):
                 await feed.evaluate("el => el.scrollTop = el.scrollHeight")
                 await page.wait_for_timeout(1500)
@@ -60,20 +81,19 @@ async def scrape_google_maps(search_term: str, max_results: int = 30, status_cal
 
         # Deduplica e limita
         places_hrefs = []
-        seen = set()
+        seen_hrefs = set()
         for link in place_links:
             href = await link.get_attribute('href')
-            if href and href not in seen:
-                seen.add(href)
+            if href and href not in seen_hrefs:
+                seen_hrefs.add(href)
                 places_hrefs.append(href)
 
         places_hrefs = places_hrefs[:max_results]
         total = len(places_hrefs)
-        report(f"📍 {total} locais encontrados. Analisando um por um...")
+        report(f"[INFO] {total} locais encontrados no Maps. Filtrando...")
 
         for idx, href in enumerate(places_hrefs, 1):
             try:
-                report(f"🔎 Analisando {idx}/{total}...")
                 new_page = await context.new_page()
                 await new_page.goto(href, wait_until="domcontentloaded")
                 await new_page.wait_for_timeout(2000)
@@ -82,15 +102,21 @@ async def scrape_google_maps(search_term: str, max_results: int = 30, status_cal
                 name_el = await new_page.query_selector('h1')
                 name = (await name_el.inner_text()).strip() if name_el else "Sem Nome"
 
-                # Verificar se tem Website — botão "Website" ou link de autoridade
+                # Verificar se ja foi vista antes (historico)
+                name_key = name.lower().strip()
+                if name_key in history:
+                    skipped_already_seen += 1
+                    report(f"  [{idx}/{total}] {name} -> Ja vista antes. Pulando.")
+                    await new_page.close()
+                    continue
+
+                # Verificar se tem Website
                 has_website = False
 
-                # Método 1: Botão com texto "Website"
                 website_btn = await new_page.query_selector('a[data-item-id="authority"]')
                 if website_btn:
                     has_website = True
 
-                # Método 2: Procurar pelo texto "Website" nos botões de ação
                 if not has_website:
                     buttons = await new_page.query_selector_all('button')
                     for btn in buttons:
@@ -102,8 +128,12 @@ async def scrape_google_maps(search_term: str, max_results: int = 30, status_cal
                         except:
                             pass
 
+                # Adicionar ao historico (independente de ter site ou nao)
+                history.add(name_key)
+
                 if has_website:
-                    report(f"   ❌ {name} → Tem site. Ignorando.")
+                    skipped_has_site += 1
+                    report(f"  [{idx}/{total}] {name} -> TEM SITE. Descartada.")
                     await new_page.close()
                     continue
 
@@ -115,7 +145,6 @@ async def scrape_google_maps(search_term: str, max_results: int = 30, status_cal
                 if phone_btn:
                     phone = (await phone_btn.inner_text()).strip()
                 else:
-                    # Alternativa: procurar pelo ícone de telefone
                     phone_items = await new_page.query_selector_all('button[data-item-id^="phone"]')
                     for item in phone_items:
                         try:
@@ -172,19 +201,28 @@ async def scrape_google_maps(search_term: str, max_results: int = 30, status_cal
                     "Rating": rating,
                     "Reviews": reviews,
                 })
-                report(f"   ✅ LEAD: {name} | Tel: {phone}")
+                report(f"  [{idx}/{total}] ++ LEAD: {name} | Tel: {phone}")
 
                 await new_page.close()
 
             except Exception as e:
-                report(f"   ⚠️ Erro ao processar local {idx}: {e}")
+                report(f"  [{idx}/{total}] ERRO ao processar: {e}")
 
         await browser.close()
 
-    report(f"\n🏁 Busca finalizada! {len(leads)} leads SEM SITE encontrados.")
+    # Salvar historico atualizado
+    save_history(history)
+
+    report("")
+    report("=" * 50)
+    report(f"[RESULTADO] {len(leads)} leads SEM SITE encontrados")
+    report(f"[DESCARTADAS] {skipped_has_site} empresas com site")
+    report(f"[JA VISTAS] {skipped_already_seen} empresas ja prospectadas antes")
+    report("=" * 50)
+
     return leads
 
 
 def run_scraper(search_term: str, max_results: int = 30, status_callback=None):
-    """Wrapper síncrono para o scraper assíncrono."""
+    """Wrapper sincrono para o scraper assincrono."""
     return asyncio.run(scrape_google_maps(search_term, max_results, status_callback))

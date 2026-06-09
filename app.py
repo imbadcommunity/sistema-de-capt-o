@@ -257,7 +257,7 @@ if start_btn:
             <div class="stat-row">
                 <div class="stat-card">
                     <div class="num">{len(leads)}</div>
-                    <div class="label">Leads Captados</div>
+                    <div class="label">Leads SEM Site</div>
                 </div>
                 <div class="stat-card">
                     <div class="num">{df['Telefone'].astype(bool).sum()}</div>
@@ -270,8 +270,10 @@ if start_btn:
             </div>
             """, unsafe_allow_html=True)
 
+            st.info("Empresas com site foram descartadas. Empresas ja vistas em buscas anteriores foram puladas automaticamente.")
+
             # Table
-            st.markdown('<div class="glass-card"><h3>📋 Leads Encontrados</h3>', unsafe_allow_html=True)
+            st.markdown('<div class="glass-card"><h3>Leads Encontrados (somente SEM site)</h3>', unsafe_allow_html=True)
             st.dataframe(df, use_container_width=True, hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
