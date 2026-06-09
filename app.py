@@ -275,19 +275,51 @@ if start_btn:
             st.dataframe(df, use_container_width=True, hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-            # Excel download
-            buffer = BytesIO()
-            df.to_excel(buffer, index=False, engine="openpyxl")
-            buffer.seek(0)
+            # Downloads
             safe = "".join(c if c.isalnum() else "_" for c in search_input)
-            filename = f"leads_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-            st.download_button(
-                label="📥 Baixar Planilha Excel (.xlsx)",
-                data=buffer,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            dl_col1, dl_col2 = st.columns(2)
+
+            with dl_col1:
+                # Excel download
+                buffer = BytesIO()
+                df.to_excel(buffer, index=False, engine="openpyxl")
+                buffer.seek(0)
+                st.download_button(
+                    label="📥 Baixar Excel (.xlsx)",
+                    data=buffer,
+                    file_name=f"leads_{safe}_{ts}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            with dl_col2:
+                # TXT download (Bloco de Notas)
+                lines = []
+                lines.append("=" * 60)
+                lines.append(f"  LEADS CAPTADOS - {search_input.strip()}")
+                lines.append(f"  Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+                lines.append("=" * 60)
+                lines.append("")
+                for i, lead in enumerate(leads, 1):
+                    lines.append(f"--- Lead #{i} ---")
+                    lines.append(f"  Empresa:   {lead.get('Name', '')}")
+                    lines.append(f"  Telefone:  {lead.get('Phone', '') or 'Nao informado'}")
+                    lines.append(f"  Endereco:  {lead.get('Address', '') or 'Nao informado'}")
+                    lines.append(f"  Nicho:     {lead.get('Category', '')}")
+                    lines.append(f"  Avaliacao: {lead.get('Rating', '') or '-'}")
+                    lines.append("")
+                lines.append("=" * 60)
+                lines.append(f"  Total: {len(leads)} leads sem site")
+                lines.append("=" * 60)
+                txt_content = "\r\n".join(lines)
+
+                st.download_button(
+                    label="📝 Baixar Bloco de Notas (.txt)",
+                    data=txt_content.encode("utf-8-sig"),
+                    file_name=f"leads_{safe}_{ts}.txt",
+                    mime="text/plain",
+                )
 
             # ─── Google Sheets ───
             st.markdown('---')
